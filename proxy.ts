@@ -5,16 +5,21 @@ import { createServerClient } from '@supabase/ssr';
 export default async function proxy(req: NextRequest) {
   const res = NextResponse.next();
 
-  // Protect /dashboard routes
+  // Protect /dashboard
   if (req.nextUrl.pathname.startsWith('/dashboard')) {
     const supabase = createServerClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
       {
         cookies: {
-          get: (name) => req.cookies.get(name)?.value,
-          set: (name, value, options) => res.cookies.set({ name, value, ...options }),
-          remove: (name, options) => res.cookies.set({ name, value: '', ...options }),
+          getAll() {
+            return req.cookies.getAll();
+          },
+          setAll(cookies) {
+            for (const { name, value, options } of cookies) {
+              res.cookies.set(name, value, options);
+            }
+          },
         },
       }
     );
