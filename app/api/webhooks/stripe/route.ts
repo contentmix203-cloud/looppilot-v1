@@ -1,5 +1,5 @@
 // app/api/webhooks/stripe/route.ts
-// Verifies Stripe signature. Updates profiles.plan_tier and current_period_end.
+// Verifies Stripe signature and updates Supabase profiles on subscription events.
 
 import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
@@ -8,10 +8,10 @@ import { createClient } from '@supabase/supabase-js';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
-  apiVersion: '2024-09-30.acacia',
-});
+// Do not pass apiVersion. Let the SDK use its bundled types to avoid TS literal mismatches.
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string);
 
+// Admin client: service role ONLY (never expose in client)
 function adminSupabase() {
   return createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL as string,
@@ -20,45 +20,50 @@ function adminSupabase() {
   );
 }
 
-function mapPriceToTier(priceId: string): 'pro_weekly' | 'pro_monthly' | null {
+function tierFromPrice(priceId: string): 'pro_weekly' | 'pro_monthly' | null {
   if (priceId === process.env.STRIPE_PRICE_ID_WEEKLY) return 'pro_weekly';
   if (priceId === process.env.STRIPE_PRICE_ID_MONTHLY) return 'pro_monthly';
   return null;
 }
 
-async function applySubscriptionToProfile(
-  supabase: ReturnType<typeof adminSupabase>,
-  sub: Stripe.Subscription
-) {
+// Some Stripe SDK versions don’t expose current_period_end on the type.
+// Use a narrow helper type to access it safely.
+type SubWithPeriodEnd = Stripe.Subscription & { current_period_end?: number };
+
+async function applySubscription(sub: Stripe.Subscription): Promise<void> {
+  const supabase = adminSupabase();
+
   const customerId = typeof sub.customer === 'string' ? sub.customer : undefined;
   if (!customerId) return;
 
-  const priceId = sub.items.data[0]?.price?.id || '';
-  const tier = mapPriceToTier(priceId);
-  const endISO = sub.current_period_end
-    ? new Date(sub.current_period_end * 1000).toISOString()
-    : null;
+  const firstItem = sub.items.data[0];
+  const priceId = firstItem?.price?.id || '';
+  const derivedTier = tierFromPrice(priceId);
 
-  const { data } = await supabase
+  const { data: profile } = await supabase
     .from('profiles')
     .select('id')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
-  if (!data?.id) return;
+  if (!profile?.id) return;
 
-  const active = sub.status === 'active' || sub.status === 'trialing';
-  const plan_tier = active ? (tier ?? 'pro_monthly') : 'free';
+  const isActive = sub.status === 'active' || sub.status === 'trialing';
+
+  const unix = (sub as SubWithPeriodEnd).current_period_end ?? null;
+  const endISO = isActive && unix ? new Date(unix * 1000).toISOString() : null;
+
+  const plan_tier = isActive ? (derivedTier ?? 'pro_monthly') : 'free';
 
   await supabase
     .from('profiles')
-    .update({ plan_tier, current_period_end: plan_tier === 'free' ? null : endISO })
-    .eq('id', data.id);
+    .update({ plan_tier, current_period_end: endISO })
+    .eq('id', profile.id);
 }
 
 export async function POST(req: NextRequest) {
-  const sig = req.headers.get('stripe-signature');
-  if (!sig) return new NextResponse('missing_signature', { status: 400 });
+  const signature = req.headers.get('stripe-signature');
+  if (!signature) return new NextResponse('missing_signature', { status: 400 });
 
   const rawBody = await req.text();
 
@@ -66,15 +71,13 @@ export async function POST(req: NextRequest) {
   try {
     event = stripe.webhooks.constructEvent(
       rawBody,
-      sig,
+      signature,
       process.env.STRIPE_WEBHOOK_SECRET as string
     );
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return new NextResponse(`invalid_signature: ${message}`, { status: 400 });
+    const msg = err instanceof Error ? err.message : String(err);
+    return new NextResponse(`invalid_signature: ${msg}`, { status: 400 });
   }
-
-  const supabase = adminSupabase();
 
   try {
     switch (event.type) {
@@ -82,40 +85,44 @@ export async function POST(req: NextRequest) {
         const sess = event.data.object as Stripe.Checkout.Session;
         if (typeof sess.subscription === 'string') {
           const sub = await stripe.subscriptions.retrieve(sess.subscription);
-          await applySubscriptionToProfile(supabase, sub);
+          await applySubscription(sub);
         }
         break;
       }
       case 'customer.subscription.created':
       case 'customer.subscription.updated': {
         const sub = event.data.object as Stripe.Subscription;
-        await applySubscriptionToProfile(supabase, sub);
+        await applySubscription(sub);
         break;
       }
       case 'customer.subscription.deleted': {
         const sub = event.data.object as Stripe.Subscription;
+        const supabase = adminSupabase();
         const customerId = typeof sub.customer === 'string' ? sub.customer : undefined;
-        if (customerId) {
-          const { data } = await supabase
+        if (!customerId) break;
+
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('id')
+          .eq('stripe_customer_id', customerId)
+          .maybeSingle();
+
+        if (profile?.id) {
+          await supabase
             .from('profiles')
-            .select('id')
-            .eq('stripe_customer_id', customerId)
-            .maybeSingle();
-          if (data?.id) {
-            await supabase
-              .from('profiles')
-              .update({ plan_tier: 'free', current_period_end: null })
-              .eq('id', data.id);
-          }
+            .update({ plan_tier: 'free', current_period_end: null })
+            .eq('id', profile.id);
         }
         break;
       }
-      // ignore other events
+      default:
+        // Ignore other events
+        break;
     }
 
     return NextResponse.json({ received: true }, { status: 200 });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return new NextResponse(`webhook_error: ${message}`, { status: 500 });
+    const msg = err instanceof Error ? err.message : String(err);
+    return new NextResponse(`webhook_error: ${msg}`, { status: 500 });
   }
 }
