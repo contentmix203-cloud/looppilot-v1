@@ -1,44 +1,116 @@
-// app/signup/page.tsx
 'use client';
 
 import { useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { createClient } from '@/lib/supabase/client';
+import { createClient } from '@/lib/supabase/browser';
 
 export default function SignupPage() {
   const supabase = createClient();
-  const router = useRouter();
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
-  const onSubmit = async (e: React.FormEvent) => {
+  async function handleSignup(e: React.FormEvent) {
     e.preventDefault();
-    setLoading(true);
-    setError(null);
-    const { error } = await supabase.auth.signUp({ email, password });
-    setLoading(false);
-    if (error) setError(error.message);
-    else router.push('/dashboard');
-  };
+    setBusy(true);
+    setErr(null);
+
+    // Create account
+    const { error: signUpErr } = await supabase.auth.signUp({ email, password });
+    if (signUpErr) {
+      setBusy(false);
+      setErr(signUpErr.message);
+      return;
+    }
+
+    // Sign in to create a session
+    const { error: signInErr } = await supabase.auth.signInWithPassword({ email, password });
+    setBusy(false);
+    if (signInErr) {
+      setErr(signInErr.message);
+      return;
+    }
+
+    // Go to dashboard after account creation
+    window.location.href = '/dashboard';
+  }
+
+  async function handleGoogleConnect() {
+    setBusy(true);
+    setErr(null);
+
+    // Require an authenticated session first
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      setBusy(false);
+      setErr('Create your LoopPilot account first, then connect Gmail.');
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/auth/google/url', { cache: 'no-store' });
+      const data = await res.json();
+      const url = data.authorize_url || data.url;
+      if (!url) throw new Error('Missing authorize_url from server');
+      window.location.href = url;
+    } catch (e: any) {
+      setBusy(false);
+      setErr(e.message || 'Failed to start Google connect');
+    }
+  }
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-semibold">Sign up</h1>
-      <form onSubmit={onSubmit} className="space-y-4">
-        <input className="w-full rounded border p-2" type="email" placeholder="Email"
-          value={email} onChange={(e) => setEmail(e.target.value)} required />
-        <input className="w-full rounded border p-2" type="password" placeholder="Password"
-          value={password} onChange={(e) => setPassword(e.target.value)} required />
-        <button className="w-full rounded bg-black px-4 py-2 text-white" disabled={loading}>
-          {loading ? 'Creating…' : 'Create account'}
+    <main className="min-h-screen flex items-start justify-center p-8">
+      <div className="w-full max-w-sm space-y-6">
+        <h1 className="text-2xl font-semibold">Sign up</h1>
+
+        {/* Connect Gmail button (works after signup creates a session) */}
+        <button
+          onClick={handleGoogleConnect}
+          disabled={busy}
+          className="w-full rounded bg-black px-4 py-2 text-white"
+        >
+          {busy ? 'Working…' : 'Sign in with Google (connect Gmail)'}
         </button>
-        {error && <p className="text-sm text-red-600">{error}</p>}
-      </form>
-      <p className="text-sm">
-        Already have an account? <a className="underline" href="/login">Log in</a>
-      </p>
-    </div>
+
+        <div className="text-sm text-gray-600">— or create your account —</div>
+
+        <form onSubmit={handleSignup} className="space-y-3">
+          <input
+            className="w-full rounded border p-2"
+            type="email"
+            placeholder="Email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+          />
+          <input
+            className="w-full rounded border p-2"
+            type="password"
+            placeholder="Password (min 6 chars)"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            minLength={6}
+            required
+          />
+          <button
+            type="submit"
+            disabled={busy}
+            className="w-full rounded bg-green-600 px-4 py-2 text-white"
+          >
+            {busy ? 'Creating account…' : 'Create account'}
+          </button>
+        </form>
+
+        <div className="text-sm">
+          Already have an account? <a className="underline" href="/login">Log in</a>
+        </div>
+
+        {err && <div className="text-sm text-red-600">{err}</div>}
+      </div>
+    </main>
   );
 }
